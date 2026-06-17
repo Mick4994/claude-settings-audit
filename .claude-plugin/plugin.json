@@ -1,0 +1,11 @@
+{
+  "name": "claude-settings-audit",
+  "version": "0.1.0",
+  "description": "Audit every change to Claude Code's user-level settings files with attribution via PostToolUse hook and Windows 4663 audit.",
+  "author": {
+    "name": "Mick4994"
+  },
+  "license": "MIT",
+  "keywords": ["audit", "settings", "change-log", "attribution", "security"],
+  "commands": ["./commands/"]
+}
