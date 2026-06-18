@@ -1,4 +1,4 @@
-﻿﻿﻿<#
+<#
 .SYNOPSIS
 Enable Windows File System audit (policy + SACL) for claude-settings-audit.
 Each run is idempotent and self-verifying.

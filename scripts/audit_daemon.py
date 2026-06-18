@@ -170,88 +170,97 @@ def audit_subscription_loop(stop: threading.Event) -> None:
     if os.name != "nt":
         log.info("non-Windows: 4663 subscription disabled")
         return
-    try:
-        import win32evtlog
-        import win32evtlogutil
-    except ImportError:
-        log.warning("pywin32 not available; 4663 subscription disabled")
+    CREATE_NO_WINDOW = 0x08000000
+    # Probe: can we read the Security log?
+    probe = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop"],
+        capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW,
+    )
+    if probe.returncode != 0:
+        log.warning("cannot read Security log (%s) - 4663 attribution disabled", probe.returncode)
+        write(normalize_warn(f"security_log_probe_failed: rc={probe.returncode}"))
         return
-    # Probe once: can we read Security log? If not, warn once and back off.
-    try:
-        hand = win32evtlog.OpenEventLog(None, "Security")
-        win32evtlog.CloseEventLog(hand)
-    except Exception as e:
-        log.warning("cannot read Security log (%s) - 4663 attribution disabled; run audit_setup.ps1 as admin to enable", e)
-        write(normalize_warn(f"security_log_unreadable: {e}"))
-        return
-    log.info("polling Security log for 4663 events")
-    last_record = 0
-    backoff = 1
+    log.info("polling Security log for 4663 events (via Get-WinEvent)")
+    backoff = 2
     while not stop.is_set():
         try:
-            flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
-            hand = win32evtlog.OpenEventLog(None, "Security")
-            try:
-                events = win32evtlog.ReadEventLog(hand, flags, 0)
-            finally:
-                win32evtlog.CloseEventLog(hand)
-            backoff = 1
-        except Exception as e:
-            backoff = min(60, backoff * 2)
-            if backoff >= 60:
-                log.warning("ReadEventLog still failing (every 60s): %s", e)
-            time.sleep(backoff)
-            continue
-        for ev in events:
-            if ev.EventID != 4663:
-                continue
-            rno = ev.RecordNumber
-            if rno <= last_record:
-                continue
-            last_record = max(last_record, rno)
-            file_path = ""
-            for s in ev.Strings or []:
-                ls = (s or "").lower()
-                if any(k in ls for k in ("settings.json", "settings.local.json", "hooks.json", "plugin.json", "marketplace.json")):
-                    file_path = s
-                    break
-            if not is_watched(file_path):
-                continue
-            try:
-                sid = win32evtlogutil.SidToString(ev.UserSID) if ev.UserSID else ""
-            except Exception:
-                sid = ""
-            user = ev.ComputerName or ""
-            pid = 0
-            try:
-                data = bytes(ev.Data or b"")
-                for off in range(0, max(1, len(data) - 4)):
-                    candidate = int.from_bytes(data[off:off + 4], "little")
-                    if 100 < candidate < 100000:
-                        pid = candidate
-                        break
-            except Exception:
-                pid = 0
-            proc = ""
-            if pid:
-                try:
-                    proc = psutil.Process(pid).exe()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    proc = ""
-            sha = _sha256_of(file_path)
-            if not deduper.should_record(file_path, sha):
-                continue
-            ev_obj = normalize_audit(
-                file_path=file_path,
-                sha256_after=sha,
-                subject_sid=sid,
-                subject_user=user,
-                process_id=pid or None,
-                process_name=proc or None,
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 # Use FilterHashTable for speed; -MaxEvents caps output
+                 "Get-WinEvent -FilterHashTable @{LogName='Security'; ID=4663} -MaxEvents 30 -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 3"],
+                capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW,
             )
-            write(ev_obj)
-            log.info("4663 -> %s by %s (pid=%s)", file_path, proc or user, pid)
-        time.sleep(1)
+            backoff = 2
+            if proc.returncode != 0 or not proc.stdout.strip():
+                time.sleep(backoff)
+                continue
+            events = _parse_4663_json(proc.stdout)
+            for e in events:
+                fp = e.get("file_path", "")
+                if not is_watched(fp):
+                    continue
+                sha = _sha256_of(fp)
+                if not deduper.should_record(fp, sha):
+                    continue
+                ev_obj = normalize_audit(
+                    file_path=fp,
+                    sha256_after=sha,
+                    subject_sid=e.get("sid", ""),
+                    subject_user=e.get("user", ""),
+                    process_id=e.get("process_id"),
+                    process_name=e.get("process_name"),
+                )
+                write(ev_obj)
+                log.info("4663 -> %s by %s (pid=%s)", fp, e.get("process_name", ""), e.get("process_id", ""))
+        except Exception as e:
+            log.warning("4663 Get-WinEvent error: %s", e)
+            time.sleep(backoff)
+            backoff = min(30, backoff * 2)
+        time.sleep(backoff)
+
+
+def _parse_4663_json(json_text: str) -> list[dict]:
+    """Parse 4663 events from PowerShell ConvertTo-Json output (array or single object)."""
+    data = []
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    for item in (parsed or []):
+        props = item.get("Properties", [])
+        # Properties is a list of {Id, Value, Type} as of ConvertTo-Json
+        try:
+            file_path = str(props[6].get("Value", "") or "") if len(props) > 6 else ""
+        except Exception:
+            file_path = ""
+        if not file_path:
+            continue
+        sid = ""
+        process_id = None
+        process_name = ""
+        user = ""
+        try:
+            sid = str(props[0].get("Value", "") or "")
+            user = str(props[1].get("Value", "") or "")
+            process_id_raw = props[10].get("Value", 0) if len(props) > 10 else 0
+            if process_id_raw:
+                process_id_raw = int(process_id_raw)
+                if 0 < process_id_raw < 1000000:
+                    process_id = process_id_raw
+            process_name = str(props[11].get("Value", "") or "") if len(props) > 11 else ""
+        except Exception:
+            pass
+        data.append({
+            "file_path": file_path,
+            "sid": sid,
+            "user": user,
+            "process_id": process_id,
+            "process_name": process_name,
+        })
+    return data
 
 
 # --- hook listener (TCP socket on localhost) ---
