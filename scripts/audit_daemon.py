@@ -250,7 +250,11 @@ def audit_subscription_loop(stop: threading.Event) -> None:
         time.sleep(1)
 
 
-# --- named-pipe listener ---
+# --- hook listener (TCP socket on localhost) ---
+
+HOST = "127.0.0.1"
+PORT = 17321
+
 
 def _process_hook_event(data: dict) -> None:
     fp = data.get("file_path", "")
@@ -272,56 +276,64 @@ def _process_hook_event(data: dict) -> None:
     log.info("hook -> %s via %s", fp, data.get("tool", "?"))
 
 
-def pipe_loop(stop: threading.Event) -> None:
-    if os.name != "nt":
-        log.info("non-Windows: named pipe disabled")
-        return
+def hook_loop(stop: threading.Event) -> None:
+    import socket
+    import select
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        import win32pipe
-        import win32file
-    except ImportError:
-        log.warning("pywin32 not available; pipe disabled")
+        sock.bind((HOST, PORT))
+    except OSError as e:
+        log.warning("hook socket bind %s:%d failed (%s) - hook channel disabled", HOST, PORT, e)
+        write(normalize_warn(f"hook_socket_bind_failed: {e}"))
         return
-    log.info("pipe listening on %s", PIPE_NAME)
+    sock.listen(8)
+    sock.settimeout(1.0)
+    log.info("hook socket listening on %s:%d", HOST, PORT)
     while not stop.is_set():
         try:
-            handle = win32pipe.CreateNamedPipe(
-                PIPE_NAME,
-                win32pipe.PIPE_ACCESS_INBOUND,
-                win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_WAIT,
-                win32pipe.PIPE_UNLIMITED_INSTANCES,
-                65536, 65536, 0, None,
-            )
-            win32pipe.ConnectNamedPipe(handle, None)
-            chunks: list[bytes] = []
             try:
+                client, addr = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError as e:
+                log.warning("hook accept error: %s", e)
+                time.sleep(0.5)
+                continue
+            client.settimeout(2.0)
+            try:
+                chunks: list[bytes] = []
                 while True:
-                    hr, data = win32file.ReadFile(handle, 65536)
+                    try:
+                        data = client.recv(65536)
+                    except socket.timeout:
+                        break
                     if not data:
                         break
-                    chunks.append(bytes(data))
-            except Exception:
-                pass
-            try:
-                win32pipe.DisconnectNamedPipe(handle)
-            except Exception:
-                pass
-            try:
-                win32file.CloseHandle(handle)
-            except Exception:
-                pass
-            blob = b"".join(chunks).decode("utf-8", errors="ignore")
-            for line in blob.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
+                    chunks.append(data)
+                    if b"\n" in data:
+                        break
+                blob = b"".join(chunks).decode("utf-8", errors="ignore")
+                for line in blob.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        _process_hook_event(json.loads(line))
+                    except Exception as e:
+                        log.warning("hook payload bad: %s", e)
+            finally:
                 try:
-                    _process_hook_event(json.loads(line))
-                except Exception as e:
-                    log.warning("hook payload bad: %s", e)
+                    client.close()
+                except Exception:
+                    pass
         except Exception as e:
-            log.warning("pipe loop error: %s - retrying", e)
+            log.warning("hook loop error: %s - retrying", e)
             time.sleep(1)
+    try:
+        sock.close()
+    except Exception:
+        pass
 
 
 # --- watchdog fallback ---
@@ -423,7 +435,7 @@ def main() -> int:
         log.info("  %s", p)
     stop = threading.Event()
     threads = [
-        threading.Thread(target=pipe_loop, args=(stop,), daemon=True, name="pipe"),
+        threading.Thread(target=hook_loop, args=(stop,), daemon=True, name="hook"),
         threading.Thread(target=audit_subscription_loop, args=(stop,), daemon=True, name="audit"),
         threading.Thread(target=watchdog_loop, args=(stop,), daemon=True, name="watchdog"),
         threading.Thread(target=self_check_loop, args=(stop,), daemon=True, name="selfcheck"),

@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 // PostToolUse hook for Claude Code. Captures settings-file changes and forwards
-// them to the Python daemon over a Windows named pipe. Must exit fast and
+// them to the Python daemon over a localhost TCP socket. Must exit fast and
 // never throw — failures are silent so Claude Code is never blocked.
 
-const fs = require('fs');
-const crypto = require('crypto');
 const net = require('net');
 
-const PIPE = '\\\\.\\pipe\\claude-settings-audit';
+const HOST = '127.0.0.1';
+const PORT = 17321;
 const TIMEOUT_MS = 200;
 
 let payload = '';
@@ -23,6 +22,7 @@ process.stdin.on('end', () => {
 });
 
 function sha256(buf) {
+  const crypto = require('crypto');
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
@@ -69,6 +69,7 @@ function handle(data) {
 
   let beforeText = '';
   try {
+    const fs = require('fs');
     if (fs.existsSync(filePath)) {
       beforeText = fs.readFileSync(filePath, 'utf8');
     }
@@ -111,7 +112,7 @@ function simpleDiff(a, b) {
 
 function send(event) {
   const json = JSON.stringify(event);
-  const sock = net.connect(PIPE);
+  const sock = net.connect(PORT, HOST);
   let done = false;
   const finish = (code) => { if (!done) { done = true; process.exit(code); } };
   sock.setTimeout(TIMEOUT_MS);
