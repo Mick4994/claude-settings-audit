@@ -1,84 +1,59 @@
 ﻿<#
 .SYNOPSIS
-Enable the Windows File System audit policy AND set SACLs on the watched files
-required by claude-settings-audit.
-.DESCRIPTION
-Idempotent. Both steps are needed for 4663 events to fire:
-  1. Global File System audit policy (auditpol /set)
-  2. Per-file SACL so Windows knows which writes to log (Set-Acl)
-Uses GUIDs (locale-independent) for category and subcategory.
+Enable Windows File System audit (policy + SACL) for claude-settings-audit.
+Each run is idempotent and self-verifying.
 #>
 $ErrorActionPreference = "Stop"
+$catGuid = "{6997984A-797A-11D9-BED3-505054503030}"
+$subGuid  = "{0CCE921E-69AE-11D9-BED3-505054503030}"
 
-$categoryGuid = "{6997984A-797A-11D9-BED3-505054503030}"   # Object Access
-$subcatGuid   = "{0CCE921E-69AE-11D9-BED3-505054503030}"   # File System
+# === Step 1: global policy (idempotent) ===
+Write-Host "[1/3] auditpol /set (GUIDs, locale-independent)"
+$ok = & auditpol.exe /set /category:$catGuid /subcategory:$subGuid /success:enable 2>&1
+if ($LASTEXITCODE -ne 0) { Write-Error "auditpol failed: $ok"; exit 1 }
+# Verify
+$state = & auditpol.exe /get /category:$catGuid /subcategory:$subGuid 2>&1
+Write-Host "  Policy state: $($state -join ' ')"
 
-# --- Step 1: global policy ---
-Write-Host "[1/2] Enabling audit policy: File System (Success) under Object Access"
-$proc = Start-Process -FilePath "auditpol.exe" `
-    -ArgumentList @("/set", "/category:$categoryGuid", "/subcategory:$subcatGuid", "/success:enable") `
-    -Wait -NoNewWindow -PassThru
-if ($proc.ExitCode -ne 0) {
-    Write-Error "auditpol set failed with exit code $($proc.ExitCode)"
-    exit $proc.ExitCode
-}
-$verify = & auditpol.exe /get /category:$categoryGuid /subcategory:$subcatGuid
-if ($verify) {
-    Write-Host "  OK"
-} else {
-    Write-Warning "  verify returned empty; SET exit 0, treating as success"
-}
-
-# --- Step 2: SACL on the 5 watched files ---
-Write-Host "[2/2] Setting SACL on the 5 watched files"
+# === Step 2: SACL on watched files via icacls (more reliable than Set-Acl) ===
+Write-Host "[2/3] SACL on watched files (icacls)"
+$homeClaude = Join-Path $HOME ".claude"
 $watched = @(
-    (Join-Path $HOME ".claude\settings.json"),
-    (Join-Path $HOME ".claude\settings.local.json"),
-    (Join-Path $HOME ".claude\hooks\hooks.json"),
-    (Join-Path $HOME ".claude\plugin.json"),
-    (Join-Path $HOME ".claude\marketplace.json")
+    (Join-Path $homeClaude "settings.json"),
+    (Join-Path $homeClaude "settings.local.json"),
+    (Join-Path $homeClaude "hooks\hooks.json"),
+    (Join-Path $homeClaude "plugin.json"),
+    (Join-Path $homeClaude "marketplace.json")
 )
-
-# Audit rule: "Everyone" Success on Write/Append/Delete/ChangePermissions/SetValue
-# This matches what 4663 events log for.
-$rights = [System.Security.AccessControl.FileSystemRights]::Write `
-       -bor [System.Security.AccessControl.FileSystemRights]::AppendData `
-       -bor [System.Security.AccessControl.FileSystemRights]::Delete `
-       -bor [System.Security.AccessControl.FileSystemRights]::ChangePermissions `
-       -bor [System.Security.AccessControl.FileSystemRights]::WriteAttributes `
-       -bor [System.Security.AccessControl.FileSystemRights]::WriteData `
-       -bor [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes
-$inheritance = [System.Security.AccessControl.InheritanceFlags]::None
-$propagation = [System.Security.AccessControl.PropagationFlags]::None
-
+# WD=WriteData, AD=AppendData, WP=WriteProperties, WA=WriteAttributes, DC=DeleteChild
+# S=Success audit, F=Failure audit — we only want Success for writes
+$icaclsSacl = "Everyone:(WD,AD,WP,WA,DC)S"
 foreach ($f in $watched) {
-    if (-not (Test-Path $f)) {
-        Write-Host "  - $f (missing, skipping)"
-        continue
+    if (-not (Test-Path $f)) { Write-Host "  - $f (missing)"; continue }
+    $out = icacls $f /setaudit $icaclsSacl 2>&1 | Select-Object -Last 1
+    Write-Host "  + $f  ($out)"
+}
+
+# === Step 3: quick self-verification ===
+Write-Host "[3/3] Trigger test write + wait 3s..."
+Add-Content -Path $watched[0] -Value "" -NoNewline -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 3
+$recent = Get-WinEvent -LogName Security -MaxEvents 10 -ErrorAction SilentlyContinue |
+    Where-Object { $_.Id -eq 4663 } | Select-Object -First 3
+if ($recent) {
+    Write-Host "  OK: 4663 events are firing (~$($recent.Count) in recent 10)"
+    $recent | ForEach-Object {
+        $props = $_.Properties
+        $file = if ($props.Count -gt 5) { $props[5].Value } else { "?" }
+        Write-Host "    file=$file"
     }
-    $acl = Get-Acl $f
-    # Build the audit ACE
-    $rule = New-Object System.Security.AccessControl.FileSystemAuditRule(
-        [System.Security.Principal.NTAccount]::new("Everyone"),
-        $rights,
-        $inheritance,
-        $propagation,
-        [System.Security.AccessControl.AuditFlags]::Success
-    )
-    # Remove any existing audit rules for Everyone first (idempotent)
-    $acl.RemoveAuditRuleSpecific($rule) | Out-Null
-    $acl.AddAuditRule($rule)
-    try {
-        Set-Acl -Path $f -AclObject $acl -ErrorAction Stop
-        Write-Host "  + $f"
-    } catch {
-        Write-Warning "  ! $f - $($_.Exception.Message)"
-    }
+} else {
+    Write-Warning "  No 4663 events in recent Security log — policy may need a reboot or group policy refresh"
+    Write-Warning "  Run: gpupdate /force"
 }
 
 $doneDir = Join-Path (Join-Path $PSScriptRoot "..") "install"
 $doneFile = Join-Path $doneDir "setup.done"
 New-Item -ItemType Directory -Path $doneDir -Force | Out-Null
 Set-Content -Path $doneFile -Value ("setup completed at " + (Get-Date -Format "o"))
-Write-Host ""
-Write-Host "Setup complete. Wrote $doneFile"
+Write-Host "Wrote $doneFile"
