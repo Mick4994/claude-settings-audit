@@ -100,10 +100,12 @@ def _sha256_of(path: str) -> str:
 
 def audit_policy_enabled() -> bool | None:
     """Return True/False if we can determine, None if we lack permission or hit an error."""
+    CREATE_NO_WINDOW = 0x08000000
     try:
         out = subprocess.run(
             ["auditpol.exe", "/get", "/subcategory:File System"],
             capture_output=True, text=True, timeout=5,
+            creationflags=CREATE_NO_WINDOW,
         )
     except Exception as e:
         log.warning("auditpol check failed: %s", e)
