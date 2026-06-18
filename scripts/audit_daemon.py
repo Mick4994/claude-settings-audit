@@ -38,6 +38,7 @@ from scripts.audit_normalize import (  # noqa: E402
 
 # --- config ---
 
+DAEMON_HOME = Path(os.environ.get("CLAUDE_AUDIT_DAEMON_HOME", str(Path(__file__).resolve().parent.parent)))
 WATCHED = [
     Path.home() / ".claude" / "settings.json",
     Path.home() / ".claude" / "settings.local.json",
@@ -45,10 +46,11 @@ WATCHED = [
     Path.home() / ".claude" / "plugin.json",
     Path.home() / ".claude" / "marketplace.json",
 ]
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("CLAUDE_AUDIT_PORT", "17321"))
 PIPE_NAME = r"\\.\pipe\claude-settings-audit"
 DEDUP_WINDOW_S = 5
 SELF_CHECK_INTERVAL_S = 60
-DAEMON_HOME = Path(__file__).resolve().parent.parent
 
 # Override event writer paths to point at our project (after install via junction,
 # DAEMON_HOME and ~/.claude/plugins/claude-settings-audit resolve to the same dir).
@@ -255,7 +257,7 @@ def audit_subscription_loop(stop: threading.Event) -> None:
 # --- hook listener (TCP socket on localhost) ---
 
 HOST = "127.0.0.1"
-PORT = 17321
+PORT = int(os.environ.get("CLAUDE_AUDIT_PORT", "17321"))
 
 
 def _process_hook_event(data: dict) -> None:

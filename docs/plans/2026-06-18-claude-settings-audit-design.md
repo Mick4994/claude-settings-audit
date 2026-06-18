@@ -71,8 +71,8 @@ Does **not** modify any settings file (read-only audit) — leaves the existing 
 
 | Source | Triggers on | Attributed to | Latency |
 |---|---|---|---|
-| Hook (named pipe) | Claude Code's own Write/Edit/Bash on a watched file | `tool_name` + `session_id` + `cwd` | < 500 ms |
-| 4663 audit subscription | Any process (including CC Switch) writes to a watched file | SID + `ProcessId` → resolved to exe path | 1–3 s |
+| Hook (TCP socket `127.0.0.1:17321`) | Claude Code's own Write/Edit/Bash on a watched file | `tool_name` + `session_id` + `cwd` | < 500 ms |
+| 4663 audit polling (`ReadEventLog`) | Any process (including CC Switch) writes to a watched file | SID + `ProcessId` → resolved to exe path | 1–3 s |
 | Watchdog | mtime change on a watched file, neither of the above claimed it | `unknown` + process snapshot (top 20 .exe paths) | 1–2 s |
 
 ### Explicit non-goals (YAGNI, v1)
@@ -93,13 +93,14 @@ Does **not** modify any settings file (read-only audit) — leaves the existing 
 - Triggered by Claude Code `PreToolUse` for `Write|Edit|MultiEdit|Bash` and `PostToolUse` for the same.
 - Filters: only acts on paths matching the 5 watched files (regex anchored to `~/.claude/`).
 - Captures from the hook payload: `tool_name`, `session_id`, `cwd`, `file_path`, plus computes `sha256_before`/`sha256_after` from the tool's input/output.
-- Sends a JSON line over `\\.\pipe\claude-settings-audit`.
-- **Hard constraint:** must complete in < 200 ms. If the named pipe is unreachable (daemon down), exit 0 silently — never block Claude Code. Diagnostics go to stderr only.
+- Sends a JSON line over TCP to `127.0.0.1:17321` (overridable via `CLAUDE_AUDIT_PORT`).
+- **Hard constraint:** must complete in < 200 ms. If the TCP socket is unreachable (daemon down), exit 0 silently — never block Claude Code. Diagnostics go to stderr only.
+- **Why TCP not named pipe:** Windows named pipes have a handle-lifecycle bug where the second `CreateNamedPipe` call after a client disconnects fails with `ERROR_ACCESS_DENIED` (5). Localhost TCP has no such issue.
 
 ### 4.2 `scripts/audit_daemon.py` (Python 3, ~400 lines)
 
-- Listens on the named pipe (one thread per connection, async via `asyncio` if simpler).
-- Subscribes to Security 4663 events via `win32evtlog.EvtSubscribe` with an XPath filter: `*[System[EventID=4663] and EventData[Data[@Name='ObjectName'] and (Data='...settings.json' or Data='...settings.local.json' or ...)]]`.
+- Listens on `127.0.0.1:17321` (overridable via `CLAUDE_AUDIT_PORT`) for hook events.
+- Subscribes to Security 4663 events via `win32evtlog.ReadEventLog` (polling) — the new `EvtSubscribe` API rejects "Security" as a channel name on classic log. Tracks last seen record number to avoid re-processing.
 - Runs `watchdog.Observer` on the 5 file paths.
 - Normalizes all 3 event sources into a single `AuditEvent` dataclass.
 - Dedupes via `dict[(file_path, sha256_after)]` with 5-second TTL.
@@ -116,13 +117,14 @@ Does **not** modify any settings file (read-only audit) — leaves the existing 
 - `change.log.jsonl` line format: `json.dumps(event) + "\n"`.
 - Rotation: when `change.log` exceeds 10 MB OR 10 000 lines, rotate to `change.log.1`, `change.log.2`, … up to 5 backups (FIFO).
 
-### 4.4 `scripts/audit_setup.ps1` (PowerShell, ~30 lines, **requires UAC**)
+### 4.4 `scripts/audit_setup.ps1` (PowerShell, **requires UAC**)
 
 - Idempotent. On run:
-  - `auditpol.exe /set /subcategory:"File System" /success:enable`
-  - Verifies with `auditpol.exe /get /subcategory:"File System"` shows `Success`
-  - Writes `install/setup.done` with timestamp
-- Re-running it just re-asserts and re-verifies.
+  - `auditpol.exe /set /category:{6997984A-797A-11D9-BED3-505054503030} /subcategory:{0CCE921E-69AE-11D9-BED3-505054503030} /success:enable` — uses **GUIDs** (locale-independent) for both category (Object Access) and subcategory (File System). Names like "File System" / "对象访问" vary by Windows language.
+  - Verifies with `auditpol /get` and accepts either "Success" (en-US), "成功" (zh-CN), or mojibake variants.
+  - Writes `install/setup.done` with timestamp.
+- Has UTF-8 BOM so PowerShell parses Chinese characters correctly.
+- Re-running just re-asserts and re-verifies.
 
 ### 4.5 `scripts/audit_install.ps1` (PowerShell, ~50 lines, no UAC)
 
@@ -151,6 +153,20 @@ Does **not** modify any settings file (read-only audit) — leaves the existing 
 - `skills`: `[]` (no skills in v1)
 - `commands`: `["./commands/"]`
 - `hooks`: **not declared** (per `~/.claude/PLUGIN_SCHEMA_NOTES.md` — auto-loaded by convention, declaring it causes "duplicate hooks file" error).
+
+---
+
+## 4a. Deviations from original plan (what changed during build)
+
+1. **Named pipe → TCP socket.** Windows named pipes fail with `ERROR_ACCESS_DENIED` (5) on the second `CreateNamedPipe` call after a client disconnects, even with `FILE_FLAG_OVERLAPPED` + `CancelIo` + timeouts. Localhost TCP on `127.0.0.1:17321` works reliably. Hook script + daemon + tests updated. Port overridable via `CLAUDE_AUDIT_PORT` env var.
+2. **`EvtSubscribe` → `ReadEventLog` polling.** The new Evt API rejects "Security" as a channel name on classic event logs. Polling `ReadEventLog` with record-number tracking works, but requires `SeSecurityPrivilege` (admin) to open the Security log. If the daemon runs as user, the 4663 thread exits with a single WARN and the watchdog fallback continues working.
+3. **`auditpol` subcategory → GUID.** English names like `"File System"` fail on zh-CN with `ERROR_INVALID_PARAMETER` (87). Use category GUID `{6997984A-797A-11D9-BED3-505054503030}` (Object Access) and subcategory GUID `{0CCE921E-69AE-11D9-BED3-505054503030}` (File System) — locale-independent.
+4. **`Join-Path` 4-arg trap.** PowerShell `Join-Path` only accepts 2 args. Several call sites had to be rewritten to use `Join-Path (Join-Path ...)` nesting or string concatenation.
+5. **`auditpol` subprocess window.** `subprocess.run(["auditpol.exe", ...])` from a `pythonw.exe` parent spawns a visible CMD window every call. Fix: pass `creationflags=CREATE_NO_WINDOW` (0x08000000) to all `subprocess.run` calls.
+6. **Daemon accepts env vars for testability.** `CLAUDE_AUDIT_PORT` (override listener port) and `CLAUDE_AUDIT_DAEMON_HOME` (override log directory) — used by `tests/test_integration_tcp.py`.
+7. **Uninstall path added.** `scripts/audit_uninstall.ps1` reverses the install: stops daemon, unregisters Task Scheduler, removes junction, removes entries from `settings.local.json`, `installed_plugins.json`, `known_marketplaces.json`, and the marketplace dir. Slash command `/settings-audit uninstall` points at it.
+8. **`/settings-audit recent` slash command added.** Shows the last N events (default 10) from `change.log.jsonl` as a one-line-per-event table (ts / source / actor / file).
+9. **Integration test added.** `tests/test_integration_tcp.py` exercises the full TCP hook path: binds a dedicated test port, sends a synthetic event, asserts both `change.log` and `change.log.jsonl` get the entry. Test total: 10/10 passing.
 
 ---
 

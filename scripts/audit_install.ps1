@@ -5,7 +5,7 @@ Install claude-settings-audit: link to ~/.claude/plugins/, register Task Schedul
 $ErrorActionPreference = "Stop"
 
 $source = Split-Path $PSScriptRoot -Parent
-$pluginRoot = "$HOME\.claude\plugins\claude-settings-audit"
+$pluginRoot = Join-Path (Join-Path (Join-Path $HOME ".claude") "plugins") "claude-settings-audit"
 $taskName = "ClaudeSettingsAuditDaemon"
 
 # 1. Junction (idempotent)
